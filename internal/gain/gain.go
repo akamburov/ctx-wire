@@ -377,7 +377,8 @@ func drainFallbackGain(primary string) error {
 			drained.WriteByte('\n')
 		}
 	}
-	if drained.Len() == 0 {
+	hasArchive := fileHasData(archivePath(fallback))
+	if drained.Len() == 0 && !hasArchive {
 		return nil
 	}
 
@@ -385,9 +386,16 @@ func drainFallbackGain(primary string) error {
 	if err != nil {
 		return err
 	}
-	if err := appendBytesLocked(primary, drained.Bytes()); err != nil {
-		unlockPrimary()
-		return err
+	if drained.Len() > 0 {
+		if err := appendBytesLocked(primary, drained.Bytes()); err != nil {
+			unlockPrimary()
+			return err
+		}
+	}
+	if hasArchive {
+		// Best-effort: an archive left behind is still summarized from the
+		// fallback family, so failing here loses nothing.
+		_ = moveArchive(fallback, primary)
 	}
 	unlockPrimary()
 
@@ -402,11 +410,16 @@ func drainFallbackGain(primary string) error {
 
 func fallbackFamilyHasData(fallback string) bool {
 	for _, path := range gainLogFamily(fallback) {
-		if st, err := os.Stat(path); err == nil && st.Size() > 0 {
+		if fileHasData(path) {
 			return true
 		}
 	}
-	return false
+	return fileHasData(archivePath(fallback))
+}
+
+func fileHasData(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && st.Size() > 0
 }
 
 func truncateCommandSample(s string) string {
@@ -521,7 +534,21 @@ func rotateGainLog(path string, incoming int64) error {
 	if st.Size()+incoming <= maxGainLogSize {
 		return nil
 	}
-	_ = os.Remove(fmt.Sprintf("%s.%d", path, maxGainRotations))
+	// Keep the oldest file's totals in the archive. They are added only once the
+	// file is really gone, so a failed delete can never count it twice, and
+	// before the shift, so a reader overlapping the shift sees the generation
+	// move and reads again. Best-effort: a failed archive loses that file's
+	// totals rather than blocking every later write.
+	oldest := fmt.Sprintf("%s.%d", path, maxGainRotations)
+	retired, foldErr := retiredTotals(oldest)
+	if err := os.Remove(oldest); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		foldErr = err
+	}
+	if foldErr != nil {
+		_ = recordRotation(path, nil)
+	} else {
+		_ = recordRotation(path, &retired)
+	}
 	for i := maxGainRotations - 1; i >= 1; i-- {
 		old := fmt.Sprintf("%s.%d", path, i)
 		next := fmt.Sprintf("%s.%d", path, i+1)
@@ -541,6 +568,13 @@ func Clear() error {
 	paths, err := gainReadPaths()
 	if err != nil {
 		return err
+	}
+	bases, err := gainBasePaths()
+	if err != nil {
+		return err
+	}
+	for _, base := range bases {
+		paths = append(paths, archivePath(base))
 	}
 	var firstErr error
 	for _, path := range paths {

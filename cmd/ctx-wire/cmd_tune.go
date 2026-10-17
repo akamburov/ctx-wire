@@ -311,7 +311,9 @@ func parseIssueArgs(args []string) (gain.Options, tune.Options, issueOptions, er
 // and tune render options (--top). It reuses parseSince so --since behaves
 // exactly like `ctx-wire gain --since`.
 func parseTuneOptions(args []string) (gain.Options, tune.Options, error) {
-	var gopts gain.Options
+	// Tune relates totals to the retained entries' opportunities, so archived
+	// totals of rotated-out logs would skew its low-volume share.
+	gopts := gain.Options{WindowOnly: true}
 	var topts tune.Options
 	for i := 0; i < len(args); i++ {
 		arg := args[i]

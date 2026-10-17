@@ -22,7 +22,7 @@ commands. For the config file and environment variables see
 | `ctx-wire uninstall [<agent>]` | With no argument, removes all ctx-wire wiring (binary, managed shims, every agent's hook/config entries). With an `<agent>` (claude, codex, cursor, ...), removes only that agent's hooks/instructions and leaves the binary, shims, and other agents intact |
 | `ctx-wire trust` | Approve this project's `.ctx-wire/filters.toml` by hash |
 | `ctx-wire untrust` | Revoke trust for this project's `.ctx-wire/filters.toml` |
-| `ctx-wire gain` | Report token savings recorded so far, with per-program, per-source, and per-agent breakdowns |
+| `ctx-wire gain` | Report all-time token savings, with per-program, per-source, and per-agent breakdowns |
 | `ctx-wire gain --since 1h` | Report only recent savings |
 | `ctx-wire gain --history [--top N] [--agent <name>]` | Recent commands (time, invoking agent, savings, full command), newest last |
 | `ctx-wire gain --agent <name>` | Keep only one invoking agent's commands; composes with any view (e.g. `--history`, `--daily`) |

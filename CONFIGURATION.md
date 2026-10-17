@@ -108,11 +108,16 @@ agent hooks keep recording savings even when an agent sandbox can execute
 commands but cannot append to `~/.local/share/ctx-wire/gain.jsonl`.
 
 The report shows bytes saved, approximate tokens saved (using a simple
-bytes-to-tokens estimate), savings by program, savings by invoking agent when
-known, and a Token Opportunities table. Opportunities are commands or filter
-paths that still emit a lot of bytes, which is the list to use when deciding
-what semantic filter to improve next. Tiny opportunities under 1 KB are hidden
-by default so the table stays actionable.
+bytes-to-tokens estimate), and savings by program, by source (hook, shim, run,
+mcp), and by invoking agent when known. Commands that still emit a lot of bytes
+are listed by `ctx-wire tune`, which is the report to use when deciding what
+semantic filter to improve next.
+
+Each log rotates at 8 MiB and keeps five rotated files. Before the oldest file
+is deleted, its totals are added to `gain-archive.json` next to the log, so the
+report's totals and breakdowns stay all-time while disk use stays bounded.
+`--since`, `--agent`, `--history`, the period views, and `ctx-wire tune` read
+only the retained entries.
 
 `ctx-wire gain --quota` shows month-to-date savings against a vendor-neutral
 token budget or, when no budget is configured, as context-window multiples. It

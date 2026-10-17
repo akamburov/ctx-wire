@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -302,6 +303,10 @@ type Options struct {
 	Since               time.Time
 	MinOpportunityBytes int64
 	Agent               string // when set, keep only this invoking agent's entries
+	// WindowOnly leaves out the archived totals of rotated-out logs, for
+	// callers that relate totals to per-entry detail (opportunities). Since and
+	// Agent imply it: the archive keeps no timestamps or per-agent programs.
+	WindowOnly bool
 }
 
 // SavingsPct returns the percentage of raw bytes saved (0 when no raw bytes).
@@ -312,7 +317,8 @@ func (s *Summary) SavingsPct() float64 {
 	return float64(s.SavedBytes) / float64(s.RawBytes) * 100
 }
 
-// Summarize reads the JSONL log and aggregates it. A missing log yields an empty
+// Summarize reads the JSONL log and aggregates it, all-time: the archived
+// totals of rotated-out logs are included. A missing log yields an empty
 // summary. Malformed lines are skipped.
 func Summarize() (*Summary, error) {
 	return SummarizeWithOptions(Options{})
@@ -323,18 +329,56 @@ func SummarizeWithOptions(opts Options) (*Summary, error) {
 	if opts.MinOpportunityBytes <= 0 {
 		opts.MinOpportunityBytes = defaultMinOpportunityBytes
 	}
-	paths, err := gainReadPaths()
+	bases, err := gainBasePaths()
 	if err != nil {
 		return nil, err
 	}
+	withArchive := !opts.WindowOnly && opts.Since.IsZero() && opts.Agent == ""
+	for attempt := 1; ; attempt++ {
+		sum, gens, err := summarizeOnce(bases, opts, withArchive)
+		if err != nil || !withArchive {
+			return sum, err
+		}
+		// A rotation during the read moves a file into the archive, so it was
+		// counted twice or not at all: read again (bounded; rotations are days
+		// apart).
+		if attempt == 3 || slices.Equal(gens, archiveGenerations(bases)) {
+			return sum, nil
+		}
+	}
+}
+
+// archiveGenerations returns each log family's archive generation.
+func archiveGenerations(bases []string) []int {
+	gens := make([]int, len(bases))
+	for i, base := range bases {
+		a, _ := readArchive(base)
+		gens[i] = a.Generation
+	}
+	return gens
+}
+
+func summarizeOnce(bases []string, opts Options, withArchive bool) (*Summary, []int, error) {
 	sum := &Summary{}
 	byProg := map[string]*CommandStat{}
 	byOpp := map[string]*OpportunityStat{}
 	byAgent := map[string]*AgentStat{}
 	bySource := map[string]*SourceStat{}
-	for _, path := range paths {
-		if err := summarizePath(path, opts, sum, byProg, byOpp, byAgent, bySource); err != nil {
-			return nil, err
+	var gens []int
+	if withArchive {
+		gens = make([]int, len(bases))
+		for i, base := range bases {
+			// Unreadable archives are skipped like unreadable logs.
+			a, _ := readArchive(base)
+			gens[i] = a.Generation
+			a.addTo(sum, byProg, byAgent, bySource)
+		}
+	}
+	for _, base := range bases {
+		for _, path := range gainLogFamily(base) {
+			if err := summarizePath(path, opts, sum, byProg, byOpp, byAgent, bySource); err != nil {
+				return nil, nil, err
+			}
 		}
 	}
 
@@ -376,7 +420,7 @@ func SummarizeWithOptions(opts Options) (*Summary, error) {
 	sort.Slice(sum.Opportunities, func(i, j int) bool {
 		return sum.Opportunities[i].EmittedBytes > sum.Opportunities[j].EmittedBytes
 	})
-	return sum, nil
+	return sum, gens, nil
 }
 
 func summarizePath(path string, opts Options, sum *Summary, byProg map[string]*CommandStat, byOpp map[string]*OpportunityStat, byAgent map[string]*AgentStat, bySource map[string]*SourceStat) error {
@@ -448,6 +492,9 @@ func summarizePath(path string, opts Options, sum *Summary, byProg map[string]*C
 		sst.EmittedBytes += int64(e.EmittedBytes)
 		sst.SavedBytes += int64(e.SavedBytes)
 
+		if byOpp == nil {
+			return // totals only (archiving a rotated-out log)
+		}
 		decision := OpportunityPolicyForEntry(e, opts.MinOpportunityBytes)
 		if decision.Include {
 			mode := e.Mode
