@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -857,5 +859,127 @@ func TestCapBucketsSmallMapUntouched(t *testing.T) {
 	}
 	if _, ok := got[otherBucket]; ok {
 		t.Errorf("small map must not synthesize an %q bucket", otherBucket)
+	}
+}
+
+// A gain total that shrinks (a log deleted by hand, a lost archive) used to be
+// resent whole as the "delta", counting the user's history twice on the
+// public stats. It must become the new mark instead, and only later growth
+// is sent.
+func TestReportImpactNeverResendsAfterShrink(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(envConfig, filepath.Join(dir, "telemetry.json"))
+	t.Setenv(envState, filepath.Join(dir, "state.json"))
+	if err := writeConfig(Config{InstallReported: true}); err != nil {
+		t.Fatal(err)
+	}
+	var sent []impactPayload
+	restoreSender(t, func(v any) error {
+		if p, ok := v.(impactPayload); ok {
+			sent = append(sent, p)
+		}
+		return nil
+	})
+	cat := func(n int64) []gain.CommandStat {
+		return []gain.CommandStat{{Program: "cat", Count: int(n), RawBytes: n * 100, EmittedBytes: n * 10, SavedBytes: n * 90}}
+	}
+
+	if _, err := ReportImpact(summary(100, 10000, 1000, 9000, cat(100))); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ReportImpact(summary(70, 7000, 700, 6300, cat(70)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Noop || len(sent) != 1 {
+		t.Fatalf("shrunken totals: result=%+v sends=%d, want a noop and no resend", res, len(sent))
+	}
+	if _, err := ReportImpact(summary(75, 7500, 750, 6750, cat(75))); err != nil {
+		t.Fatal(err)
+	}
+	if len(sent) != 2 {
+		t.Fatalf("sends = %d, want 2", len(sent))
+	}
+	if got := sent[1]; got.Commands != 5 || got.BytesSaved != 450 || got.Programs["cat"].Count != 5 {
+		t.Fatalf("growth after the shrink = %+v, want 5 commands / 450 saved", got)
+	}
+}
+
+// The mark sums per-command token estimates, each rounded up, so it runs a few
+// tokens ahead of an estimate over the summed bytes. That drift used to read
+// as a shrink and resend whole buckets; with no new bytes nothing is sent.
+func TestReportImpactIgnoresTokenRoundingDrift(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(envConfig, filepath.Join(dir, "telemetry.json"))
+	t.Setenv(envState, filepath.Join(dir, "state.json"))
+	if err := writeConfig(Config{InstallReported: true}); err != nil {
+		t.Fatal(err)
+	}
+	// Three flushed commands that each saved 1 byte: 3 tokens on the mark,
+	// ceil(3/4) = 1 token over the same bytes.
+	one := ProgramTotals{Count: 3, RawBytes: 6, EmittedBytes: 3, BytesSaved: 3, TokensSaved: 3}
+	if err := writeState(stateFile{LastReported: Totals{
+		Commands: 3, RawBytes: 6, EmittedBytes: 3, BytesSaved: 3, TokensSaved: 3,
+		Programs: map[string]ProgramTotals{"cat": one},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	sends := 0
+	restoreSender(t, func(any) error { sends++; return nil })
+
+	res, err := ReportImpact(summary(3, 6, 3, 3, []gain.CommandStat{
+		{Program: "cat", Count: 3, RawBytes: 6, EmittedBytes: 3, SavedBytes: 3},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Noop || sends != 0 {
+		t.Fatalf("result=%+v sends=%d, want a noop: nothing new was recorded", res, sends)
+	}
+}
+
+// Every private program maps to "other"; the summary's buckets must add up
+// into it rather than the last one overwriting the rest.
+func TestTotalsFromSummarySumsOtherBucket(t *testing.T) {
+	got := totalsFromSummary(summary(5, 500, 50, 450, []gain.CommandStat{
+		{Program: "zzprivatea", Count: 3, RawBytes: 300, EmittedBytes: 30, SavedBytes: 270},
+		{Program: "zzprivateb", Count: 2, RawBytes: 200, EmittedBytes: 20, SavedBytes: 180},
+	}))
+	if other := got.Programs[otherBucket]; other.Count != 5 || other.BytesSaved != 450 {
+		t.Fatalf("other bucket = %+v, want 5 runs / 450 saved", other)
+	}
+}
+
+// Where the state cannot be written (an agent sandbox that denies the data
+// dir), a sent report could never be marked done, so every later `gain` resent
+// the same totals. Nothing may be sent that cannot be recorded as sent.
+func TestReportImpactSendsNothingWhenStateIsReadOnly(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("needs POSIX directory permissions enforced")
+	}
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
+	t.Setenv(envConfig, filepath.Join(dir, "telemetry.json"))
+	t.Setenv(envState, filepath.Join(stateDir, "state.json"))
+	if err := writeConfig(Config{InstallReported: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeState(stateFile{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(stateDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(stateDir, 0o700) })
+	sends := 0
+	restoreSender(t, func(any) error { sends++; return nil })
+
+	for i := 0; i < 2; i++ {
+		if _, err := ReportImpact(summary(10, 1000, 100, 900, nil)); err == nil {
+			t.Fatal("ReportImpact succeeded with an unwritable state")
+		}
+	}
+	if sends != 0 {
+		t.Fatalf("sent %d reports that could not be recorded as sent", sends)
 	}
 }

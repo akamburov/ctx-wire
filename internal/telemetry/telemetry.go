@@ -347,19 +347,36 @@ func ReportImpact(summary *gain.Summary) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	delta := subtractTotals(current, st.LastReported)
+	delta, ok := subtractTotals(current, st.LastReported)
+	if !ok {
+		// The local totals shrank, so resending them would count history twice.
+		// Take them as the new mark and send nothing; only the unflushed pending
+		// commands go unreported.
+		st.LastReported = current
+		st.Pending = Totals{}
+		if err := writeState(st); err != nil {
+			return Result{}, err
+		}
+		return Result{Noop: true}, nil
+	}
 	if totalsEmpty(delta) {
 		return Result{Noop: true}, nil
 	}
 	sanitizeTotals(&delta) // belt-and-suspenders: nothing unsafe reaches the wire
 
+	// Write the state before sending: where it cannot be written (an agent
+	// sandbox that denies the data dir), the send could never be marked done
+	// and every later run would resend the same totals.
+	st.LastAttempt = clockNow().UTC().Format(time.RFC3339)
+	if err := writeState(st); err != nil {
+		return Result{}, err
+	}
 	payload := buildImpactPayload(delta, cfg)
 	if err := sendPayload(payload); err != nil {
 		return Result{}, err
 	}
 	st.LastReported = current
 	st.Pending = Totals{}
-	st.LastAttempt = clockNow().UTC().Format(time.RFC3339)
 	if err := writeState(st); err != nil {
 		return Result{}, err
 	}
@@ -435,13 +452,14 @@ func totalsFromSummary(summary *gain.Summary) Totals {
 		if name == "" {
 			continue
 		}
-		t.Programs[name] = ProgramTotals{
+		// Every private program collapses to "other", so add, never overwrite.
+		t.Programs[name] = addBucket(t.Programs[name], ProgramTotals{
 			Count:        int64(p.Count),
 			RawBytes:     p.RawBytes,
 			EmittedBytes: p.EmittedBytes,
 			BytesSaved:   p.SavedBytes,
 			TokensSaved:  approxTokens(p.SavedBytes),
-		}
+		})
 	}
 	for _, a := range summary.ByAgent {
 		name := safeAgentName(a.Agent)
@@ -451,13 +469,13 @@ func totalsFromSummary(summary *gain.Summary) Totals {
 		if t.Agents == nil {
 			t.Agents = map[string]ProgramTotals{}
 		}
-		t.Agents[name] = ProgramTotals{
+		t.Agents[name] = addBucket(t.Agents[name], ProgramTotals{
 			Count:        int64(a.Commands),
 			RawBytes:     a.RawBytes,
 			EmittedBytes: a.EmittedBytes,
 			BytesSaved:   a.SavedBytes,
 			TokensSaved:  approxTokens(a.SavedBytes),
-		}
+		})
 	}
 	return t
 }
@@ -557,26 +575,33 @@ func parseStateTime(value string) time.Time {
 	return t
 }
 
-func subtractTotals(current, previous Totals) Totals {
+// subtractTotals returns what grew since the last report. ok is false when the
+// gain totals shrank below the mark (a log deleted by hand, a lost archive), in
+// which case nothing in them can be told apart from what was already sent.
+// Tokens are derived from the saved-bytes delta rather than compared: the mark
+// sums per-command estimates, each rounded up, so it runs slightly ahead of an
+// estimate over the summed bytes and would otherwise read as a shrink.
+func subtractTotals(current, previous Totals) (delta Totals, ok bool) {
 	if current.Commands < previous.Commands ||
 		current.RawBytes < previous.RawBytes ||
 		current.EmittedBytes < previous.EmittedBytes ||
-		current.BytesSaved < previous.BytesSaved ||
-		current.TokensSaved < previous.TokensSaved {
-		return current
+		current.BytesSaved < previous.BytesSaved {
+		return Totals{}, false
 	}
-	delta := Totals{
+	delta = Totals{
 		Commands:     current.Commands - previous.Commands,
 		RawBytes:     current.RawBytes - previous.RawBytes,
 		EmittedBytes: current.EmittedBytes - previous.EmittedBytes,
 		BytesSaved:   current.BytesSaved - previous.BytesSaved,
-		TokensSaved:  current.TokensSaved - previous.TokensSaved,
 		Programs:     subtractBuckets(current.Programs, previous.Programs),
 		Agents:       subtractBuckets(current.Agents, previous.Agents),
 	}
-	return delta
+	delta.TokensSaved = approxTokens(delta.BytesSaved)
+	return delta, true
 }
 
+// subtractBuckets returns each bucket's growth. A bucket that shrank (its
+// commands moved to a newly allowlisted name) is left out, never resent whole.
 func subtractBuckets(current, previous map[string]ProgramTotals) map[string]ProgramTotals {
 	if len(current) == 0 {
 		return nil
@@ -587,9 +612,7 @@ func subtractBuckets(current, previous map[string]ProgramTotals) map[string]Prog
 		if cur.Count < prev.Count ||
 			cur.RawBytes < prev.RawBytes ||
 			cur.EmittedBytes < prev.EmittedBytes ||
-			cur.BytesSaved < prev.BytesSaved ||
-			cur.TokensSaved < prev.TokensSaved {
-			out[name] = cur
+			cur.BytesSaved < prev.BytesSaved {
 			continue
 		}
 		pd := ProgramTotals{
@@ -597,7 +620,7 @@ func subtractBuckets(current, previous map[string]ProgramTotals) map[string]Prog
 			RawBytes:     cur.RawBytes - prev.RawBytes,
 			EmittedBytes: cur.EmittedBytes - prev.EmittedBytes,
 			BytesSaved:   cur.BytesSaved - prev.BytesSaved,
-			TokensSaved:  cur.TokensSaved - prev.TokensSaved,
+			TokensSaved:  approxTokens(cur.BytesSaved - prev.BytesSaved),
 		}
 		if !programEmpty(pd) {
 			out[name] = pd
