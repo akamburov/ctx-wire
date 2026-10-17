@@ -68,6 +68,14 @@ const MAX_TOKENS_SAVED = 300_000_000;
 // one such report every few minutes per IP is not.
 const HEAVY_REPORT_TOKENS = 25_000_000;
 const HEAVY_REPORT_BYTES = 100 * 1024 * 1024;
+// A genuine report carries one flush interval of commands: the heaviest
+// observed real workload peaks near 1.4k per 30 minutes and 42k in a whole
+// week. A report past this is a client resending history it already reported:
+// clients before 0.1.72 resent their whole retained gain log after every log
+// rotation, and any client resends everything once its telemetry state is
+// lost. It is acknowledged, so the client advances its mark and stops, but
+// not recorded.
+const MAX_REPORT_COMMANDS = 50_000;
 const MAX_PROGRAMS = 50;
 const MAX_AGENTS = 20;
 const MAX_PROGRAM_RUNS = 100_000;
@@ -210,6 +218,11 @@ async function writeTelemetry(request: Request, env: Env): Promise<Response> {
   // attribute skew attempts; the report still lands with the clamped values.
   if (impact.flags.length > 0) {
     console.log("consistency guard", country, impact.flags.join(","));
+  }
+
+  if (commands > MAX_REPORT_COMMANDS) {
+    console.log("history resend ignored", country, version, commands);
+    return json({ ok: true, ignored: "history_resend" });
   }
 
   if (

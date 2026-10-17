@@ -76,6 +76,11 @@ real auth). Protection is therefore about bounding blast radius, not identity:
 - **Value clamps** on every numeric field and a strict name regex on
   program/agent keys, so a single report can only move aggregates within sane
   bounds.
+- **History resends are ignored.** A genuine report carries one flush interval
+  of commands (the heaviest real workload peaks near 1.4k per 30 minutes), so an
+  impact report with more than 50,000 commands is a client resending what it
+  already reported (clients before 0.1.72 did this after every gain log
+  rotation). It gets `200` so the client stops retrying, but is not recorded.
 - `schema` and `event` are validated; oversized bodies get `413`.
 - Cloudflare's edge DDoS/bot protection handles the crude floods.
 

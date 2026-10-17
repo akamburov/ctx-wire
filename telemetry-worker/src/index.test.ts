@@ -48,6 +48,22 @@ describe("D1 write failure handling", () => {
   });
 });
 
+describe("history resends", () => {
+  // Every D1 write fails here, so a 200 proves the report never reached D1.
+  it("acknowledges a whole-history resend without recording it", async () => {
+    const req = postJSON({ ...base, commands: 158_883, raw_bytes: 42_316_218_041, emitted_bytes: 351_520_813, bytes_saved: 41_964_697_228, tokens_saved: 10_491_174_307 });
+    const res = await worker.fetch(req, failingD1Env(), ctx);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, ignored: "history_resend" });
+  });
+
+  it("still records a heavy but genuine flush", async () => {
+    const req = postJSON({ ...base, commands: 1_400, raw_bytes: 5_000_000, emitted_bytes: 500_000, bytes_saved: 4_500_000, tokens_saved: 1_125_000 });
+    const res = await worker.fetch(req, failingD1Env(), ctx);
+    expect(res.status).toBe(503); // reached the (failing) write
+  });
+});
+
 describe("sanitizeImpact", () => {
   it("passes a stock client report through unchanged", () => {
     const r = sanitizeImpact({
