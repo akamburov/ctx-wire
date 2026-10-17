@@ -29,14 +29,10 @@ type claudeOutput struct {
 }
 
 type claudeHookOutput struct {
-	HookEventName            string              `json:"hookEventName"`
-	PermissionDecision       string              `json:"permissionDecision"`
-	PermissionDecisionReason string              `json:"permissionDecisionReason,omitempty"`
-	UpdatedInput             *claudeUpdatedInput `json:"updatedInput,omitempty"`
-}
-
-type claudeUpdatedInput struct {
-	Command string `json:"command"`
+	HookEventName            string          `json:"hookEventName"`
+	PermissionDecision       string          `json:"permissionDecision"`
+	PermissionDecisionReason string          `json:"permissionDecisionReason,omitempty"`
+	UpdatedInput             json.RawMessage `json:"updatedInput,omitempty"`
 }
 
 // Claude handles a Claude Code PreToolUse payload. For Bash: if the command is
@@ -68,9 +64,15 @@ func Claude(r io.Reader, w io.Writer) error {
 
 func claudeBash(in claudeInput, w io.Writer) error {
 	var ti struct {
-		Command string `json:"command"`
+		Command                   string `json:"command"`
+		DangerouslyDisableSandbox bool   `json:"dangerouslyDisableSandbox"`
 	}
 	if json.Unmarshal(in.ToolInput, &ti) != nil || ti.Command == "" {
+		return nil
+	}
+	// A call that asks to leave the sandbox needs the user's approval, and the
+	// "allow" below would skip that prompt. Step aside so Claude decides.
+	if ti.DangerouslyDisableSandbox {
 		return nil
 	}
 	// Inside a worktree-isolated session Claude Code refuses any command that
@@ -102,11 +104,15 @@ func claudeBash(in claudeInput, w io.Writer) error {
 	if isolatedGit && rules.Decide(rewritten) != permission.Allow {
 		return nil
 	}
+	updated := toolInputWithCommand(in.ToolInput, rewritten)
+	if updated == nil {
+		return nil
+	}
 	return json.NewEncoder(w).Encode(claudeOutput{
 		HookSpecificOutput: claudeHookOutput{
 			HookEventName:      "PreToolUse",
 			PermissionDecision: "allow",
-			UpdatedInput:       &claudeUpdatedInput{Command: rewritten},
+			UpdatedInput:       updated,
 		},
 	})
 }
